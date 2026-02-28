@@ -4,6 +4,8 @@ import mediapipe as mp
 import cv2
 import numpy as np
 import time
+import subprocess
+import os
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from scipy.spatial import distance as dist
@@ -60,6 +62,15 @@ FRAME_HISTORY = 8
 empty_frame = {'hipL_y': 0, 'hipR_y': 0, 'hips_dy': 0, 'signed': False}
 last_frames = FRAME_HISTORY * [empty_frame.copy()]
 
+# Gesture confirmation system
+GESTURE_CONFIRMATION_FRAMES = 5  # Require 5 consecutive frames of same gesture
+gesture_buffer = []  # List of detected semaphores
+last_confirmed_gesture = None  # Last gesture we actually output
+
+# Output file and notepad
+OUTPUT_FILE = 'semaphore_output.txt'
+notepad_process = None
+
 # --- HELPER FUNCTIONS (Logic remains largely same, just fed from new API) ---
 
 
@@ -103,6 +114,61 @@ def output(keys, image, display_only=True):
                         cv2.FONT_HERSHEY_SIMPLEX, 3, (0, 0, 255), 5)
 
 
+def check_gesture_confirmation(detected_gesture):
+    """Add to buffer and check if we have enough confirmation frames."""
+    global gesture_buffer, last_confirmed_gesture
+
+    # If it's a different gesture, reset the buffer
+    if detected_gesture is None:
+        gesture_buffer = []
+        return None
+
+    if not gesture_buffer or gesture_buffer[-1] == detected_gesture:
+        gesture_buffer.append(detected_gesture)
+    else:
+        # Different gesture detected, reset buffer
+        gesture_buffer = [detected_gesture]
+
+    # If we have enough confirmations, output and reset
+    if len(gesture_buffer) >= GESTURE_CONFIRMATION_FRAMES:
+        # Only output if it's different from the last confirmed gesture
+        if detected_gesture != last_confirmed_gesture:
+            print(f"✓ CONFIRMED: '{detected_gesture}' (after {len(gesture_buffer)} frames)")
+            last_confirmed_gesture = detected_gesture
+            gesture_buffer = []  # Reset buffer after output
+            return detected_gesture
+
+    return None
+
+
+def snap_to_nearest_semaphore(detected_l_ang, detected_r_ang, tolerance=15):
+    """
+    Snap detected angles to the nearest valid semaphore angles.
+    Returns (snapped_l_ang, snapped_r_ang, match) or (None, None, None) if no match within tolerance.
+    """
+    best_match = None
+    best_distance = float('inf')
+
+    # Extract all valid angle pairs from SEMAPHORES dictionary
+    for (l_ang, r_ang) in SEMAPHORES.keys():
+        # Calculate angular distance (accounting for wrap-around at 360/-180)
+        l_diff = min(abs(detected_l_ang - l_ang), 360 - abs(detected_l_ang - l_ang))
+        r_diff = min(abs(detected_r_ang - r_ang), 360 - abs(detected_r_ang - r_ang))
+
+        # Total distance (sum of both arm angle differences)
+        total_distance = l_diff + r_diff
+
+        # Check if this is the best match and within tolerance
+        if total_distance < best_distance and total_distance <= (tolerance * 2):
+            best_distance = total_distance
+            best_match = (l_ang, r_ang)
+
+    if best_match:
+        return best_match[0], best_match[1], SEMAPHORES[best_match]
+
+    return None, None, None
+
+
 def draw_manual_skeleton(image, pose_landmarks):
     h, w, _ = image.shape
 
@@ -123,11 +189,49 @@ def draw_manual_skeleton(image, pose_landmarks):
         cv2.line(image, start_point, end_point,
                  (255, 255, 255), 2)  # White lines
 
+
+def draw_gesture_info(image, detected_gesture, l_ang, r_ang, snapped_l, snapped_r, buffer_count, confirmed=False):
+    """Draw gesture detection info on the camera frame."""
+    h, w, _ = image.shape
+    y_offset = 30
+
+    # Draw semi-transparent background for text readability
+    cv2.rectangle(image, (10, 10), (w - 10, 200), (0, 0, 0), -1)
+    cv2.rectangle(image, (10, 10), (w - 10, 200), (255, 255, 255), 2)
+
+    if detected_gesture:
+        # Large letter display
+        cv2.putText(image, f"Letter: {detected_gesture.upper()}", (30, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
+        y_offset += 50
+
+        # Angle info
+        cv2.putText(image, f"Raw: L={l_ang}° R={r_ang}°", (30, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 0), 2)
+        y_offset += 35
+
+        cv2.putText(image, f"Snapped: L={snapped_l}° R={snapped_r}°", (30, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 0), 2)
+        y_offset += 35
+
+        # Buffer progress
+        color = (0, 255, 0) if buffer_count >= GESTURE_CONFIRMATION_FRAMES else (0, 165, 255)
+        cv2.putText(image, f"Confirmation: {buffer_count}/{GESTURE_CONFIRMATION_FRAMES}", (30, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+        # Draw confirmation message if complete
+        if confirmed:
+            cv2.putText(image, "✓ CONFIRMED!", (w - 300, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+    else:
+        cv2.putText(image, "No gesture detected", (30, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (100, 100, 100), 2)
+
 # --- MAIN ENGINE ---
 
 
 def main():
-    global last_frames, frame_midpoint, current_semaphore, last_keys
+    global last_frames, frame_midpoint, current_semaphore, last_keys, gesture_buffer, last_confirmed_gesture
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--type', '-t', action='store_true',
@@ -144,11 +248,14 @@ def main():
     )
 
     with vision.PoseLandmarker.create_from_options(options) as landmarker:
+        frame_count = 0
         while cap.isOpened():
             cv2.namedWindow('Semaphore Tasks API', cv2.WINDOW_NORMAL)
             success, frame = cap.read()
             if not success:
                 break
+
+            frame_count += 1
 
             # Tasks API requires mp.Image
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
@@ -165,24 +272,49 @@ def main():
                     body.append({'x': 1 - landmark.x, 'y': 1 -
                                 landmark.y, 'visibility': landmark.visibility})
 
-                # Simple Gesture Logic (Mouth Cover example)
-                mouth = (body[9], body[10])
-                palms = (body[19], body[20])
-                if abs(mouth[0]['x'] - palms[0]['x']) < MOUTH_COVER_THRESHOLD:
-                    output(['backspace'], frame, not args.type)
-
                 # Arm Semaphore Logic
                 armL = (body[11], body[13], body[15])
                 armR = (body[12], body[14], body[16])
+
+                # Debug: show arm visibility
+                l_visible = all(j['visibility'] >= VISIBILITY_THRESHOLD for j in armL)
+                r_visible = all(j['visibility'] >= VISIBILITY_THRESHOLD for j in armR)
+
+                detected_gesture = None
+                snapped_l = None
+                snapped_r = None
+                l_ang_display = 0
+                r_ang_display = 0
+
                 if is_limb_pointing(*armL) and is_limb_pointing(*armR):
                     l_ang, r_ang = get_limb_direction(
                         armL), get_limb_direction(armR)
-                    match = SEMAPHORES.get((l_ang, r_ang))
+                    l_ang_display = l_ang
+                    r_ang_display = r_ang
+
+                    # Try to snap to nearest valid semaphore angles
+                    snapped_l, snapped_r, match = snap_to_nearest_semaphore(l_ang, r_ang, tolerance=15)
+
                     if match:
-                        key = match['a']
-                        if [key] != last_keys:
-                            output([key], frame, not args.type)
-                            last_keys = [key]
+                        detected_gesture = match['a']
+                        print(f"[Frame {frame_count}] Gesture detected: '{detected_gesture}' (Raw: L={l_ang}°, R={r_ang}° → Snapped: L={snapped_l}°, R={snapped_r}°) | Buffer: {len(gesture_buffer)}/{GESTURE_CONFIRMATION_FRAMES}")
+                    else:
+                        # Debug: show detected angles even if no match
+                        print(f"[Frame {frame_count}] Angles detected: Left={l_ang}°, Right={r_ang}° (no match within tolerance)")
+                else:
+                    # Debug: show why pose isn't recognized
+                    l_pointing = is_limb_pointing(*armL)
+                    r_pointing = is_limb_pointing(*armR)
+                    if l_visible and r_visible:
+                        print(f"[Frame {frame_count}] Arms visible but not pointing correctly. L_pointing={l_pointing}, R_pointing={r_pointing}")
+
+                # Check if we have confirmation
+                confirmed = check_gesture_confirmation(detected_gesture)
+                if confirmed:
+                    output([confirmed], frame, not args.type)
+
+                # Draw gesture info on the frame
+                draw_gesture_info(frame, detected_gesture, l_ang_display, r_ang_display, snapped_l, snapped_r, len(gesture_buffer), confirmed is not None)
 
             cv2.imshow('Semaphore Tasks API', frame)
             if cv2.waitKey(1) & 0xFF == 27:
